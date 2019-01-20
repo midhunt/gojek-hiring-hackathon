@@ -1,0 +1,1343 @@
+---
+title: "Duration Online Prediction for Drivers"
+author: "Midhun Thaduru"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    fontsize: 14pt
+    highlight: monochrome
+    number_sections: no
+    theme: cosmo
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE, results='hide'}
+
+# Setting the chunk options
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, 
+                      warning = FALSE, message = FALSE)
+
+# Loading the required libraries
+library(data.table)
+library(ggplot2)
+library(psych)
+library(aTSA)
+library(zoo)
+library(glmnet)
+library(rpart)
+library(rattle)
+library(randomForest)
+
+# Changing theme of ggplot to black n white
+theme_set(theme_bw(12))
+
+```
+
+# Problem Statement
+
+Go-Jek has a lot of driver partners on their platform. If a driver is online, Go-Jek gets pings every 15 seconds from the driver mobile phone indicating that he/she is available online.  
+
+The provided dataset contains three files:  
+* **drivers.csv** file contains driver profile data  
+* **pings.csv** file contains driver pings  
+* **test.csv** file has the test data.  
+
+Both, **drivers.csv** and **pings.csv** can be used for training the model and **test.csv** should be used for testing the model.  
+
+The aim of this assignment is to predict the duration online(in hrs) for its driver partners.  
+
+# Reading and Exploring Dataset
+
+The dataset will be loaded into the environment and the structure and data types of the variables in the dataset will be explored in this section.  
+
+## Pings Data
+
+Pings data contains **driver_id** and **ping_timestamp**. The data type of columns and sample of the pings data can be viewed below:    
+
+```{r LoadingTrainingSet, results='markup'}
+
+# Reading the pings dataset
+dtPings <- fread(
+  paste0(
+    Sys.getenv("MyGitRepo"),
+    "/Go-Jek/DS TakeHome Assignment/data/pings.csv"
+  )
+)
+
+# Understanding the data types of the columns present in the dataset
+str(dtPings)
+
+# Ordering the dataset based on timestamp for each driver
+setorder(dtPings, driver_id, ping_timestamp)
+
+# coverting ping_timestamp into human readable format
+dtPings[, ping_timestamp := as.POSIXct(ping_timestamp,
+                                       origin = "1970-01-01",
+                                       tz = "WIB")]
+
+# Looking at the sample of the dataset
+rbind.data.frame(head(dtPings, 3), tail(dtPings, 3))
+
+```
+
+<br>
+
+Pings data is available from `r min(dtPings$ping_timestamp)` to `r max(dtPings$ping_timestamp)`. But, it was stated in the problem statement that training set is provided from 1st June, 2017 to 21st June 2017. So, the data will be ignored for 22nd June, 2017 from pings data.  
+
+```{r IngoringPingData}
+
+dtPings <- dtPings[ping_timestamp < as.POSIXct("2017-06-22 00:00:00", 
+                                               tz = "WIB")]
+
+```
+
+## Driver Details
+
+The dataset also contains driver information like **driver_id,** **gender,** **age** and **number_of_kids**.  
+
+```{r LoadingDriverDetails, results='markup'}
+
+# Reading driver details
+dtDriverDetails <- fread(
+  paste0(
+    Sys.getenv("MyGitRepo"),
+    "/Go-Jek/DS TakeHome Assignment/data/drivers.csv"
+  )
+)
+
+str(dtDriverDetails)
+
+rbind.data.frame(head(dtDriverDetails, 3), tail(dtDriverDetails, 3))
+
+```
+
+<br>
+
+## Test Set
+
+Test set contains **driver_id,** **date** and **online_hours** for which the model has to predict duration online(in hrs) from 22nd June, 2017 to 28th June, 2017.  
+
+```{r LoadingTestingData, results='markup'}
+
+# Loading the test set 
+dtTest <- fread(
+  paste0(
+    Sys.getenv("MyGitRepo"),
+    "/Go-Jek/DS TakeHome Assignment/data/test.csv"
+  )
+)
+
+# Checking the structure of testing set
+str(dtTest)
+
+# Converting date to appropriate format
+dtTest[, date := as.Date(date, "%Y-%m-%d")]
+
+# Ordering the test data by driver_id and date
+setorder(dtTest, driver_id, date)
+
+# Print first and last few rows
+rbind.data.frame(head(dtTest, 3), tail(dtTest, 3))
+
+```
+
+<br>
+
+# Exploratory Data Analysis and Data Validation
+
+There are **`r length(unique(dtPings$driver_id))`** drivers in the pings data and all the driver_ids that are present in pings data are also `r if(!any(!(unique(dtPings$driver_id) %in% dtDriverDetails$driver_id))) {"available"} else {"not available"}` in driver details. `r length(unique(dtTest$driver_id)[!(unique(dtTest$driver_id) %in% unique(dtPings$driver_id))])` drivers who are present in the test set are not available in training set.  
+
+```{r CalculatingTimeDifference}
+
+# Extracting the date from the timestamp
+dtPings[, date := as.Date(ping_timestamp)]
+
+# Calculating time difference for each ping and for each rider
+dtPings[, ping_time_difference := c(0, diff(ping_timestamp)),
+        by = driver_id]
+
+```
+
+Below plot of time difference between consecutive ping timestamps against the ping timestamp for couple of drivers will help us understand driver online pattern.  
+
+```{r DriverPingTimeDifference, fig.cap="fig. 1", fig.width=8, fig.align='center'}
+
+ggplot(dtPings[driver_id %in% unique(dtPings$driver_id)[1:2] &
+                 date %in% unique(dtPings$date)[1:3]]) +
+  geom_point(aes(x = ping_timestamp, y = ping_time_difference)) +
+  geom_line(aes(x = ping_timestamp, y = ping_time_difference)) +
+  scale_y_continuous(labels = scales::comma) +
+  facet_grid(driver_id ~ .) +
+  xlab("Ping Timestamp") +
+  ylab("Delta Time (secs)") +
+  ggtitle("Time Difference Between Each Ping for Couple of Drivers")
+
+```
+
+<br>
+
+In fig. 1, the thick points for a continuous stretch shows the delta time difference is close to **0 secs** i.e. the driver is available and the line connecting continuous stretch of points shows that the driver is offline. For e.g. driver_id 111556 is online on June 1st, 2nd and then on June 5th, 2017.  
+
+Below plot explores the time difference for driver_id `r unique(dtPings$driver_id)[1]` on `r unique(dtPings$date)[1]` to see the max time difference between consecutive ping timestamps.  
+
+```{r OnlineDurationforSingleDriver, fig.cap="fig. 2", fig.width=8, fig.align='center'}
+
+ggplot(dtPings[driver_id %in% unique(dtPings$driver_id)[1] &
+                 date %in% unique(dtPings$date)[1]]) +
+  geom_point(aes(x = ping_timestamp, y = ping_time_difference)) +
+  geom_line(aes(x = ping_timestamp, y = ping_time_difference)) +
+  xlab("Ping Timestamp") +
+  ylab("Delta Time (secs)") +
+  ggtitle(paste0("Time Difference Between Each Ping for driver_id ",
+                 unique(dtPings$driver_id)[1], " on ",
+                 unique(dtPings$date)[1]))
+
+```
+
+<br>
+
+Fig. 2 shows that the time difference between each ping is not exactly 15 secs but it could vary due to the availability of network or some other issue. So, I will assume that if a driver is not available for more than **`r nTimeDifference_secs <- 120; nTimeDifference_secs` secs** then the driver is offline. Based on the assumption I will split the data into multiple sessions for every day and the time difference will be re-calculated within each session.    
+
+```{r DriverSessionIDCalculation}
+
+# Creating driver session for calculating duration online
+dtPings[, session_id := cumsum(
+  ping_time_difference > nTimeDifference_secs
+) + 1L, by = c("driver_id", "date")]
+
+# Recalculating the ping time difference within each session
+dtPings[, ping_time_difference := c(0, diff(ping_timestamp)),
+        by = c("driver_id", "date", "session_id")]
+
+```
+
+Once we have the consecutive ping timestamp difference for each session, we can calculate the duration online by each session and in turn duration online by day for each driver.  
+
+```{r DriverSessionAndDayDurationCalculation}
+
+# Calculating duration online during each session, day for each driver
+# Dividing the time difference with 3600 to get time in hrs
+dtSessionDuration <- dtPings[, 
+                     .(duration_online_hrs = round(
+                       sum(ping_time_difference)/3600, 2)), 
+                     by = c("driver_id", "date", "session_id")]
+
+# Calculating duration online during each day for each driver
+dtDayDuration <- dtSessionDuration[,
+                     .(duration_online_hrs = sum(duration_online_hrs)),
+                     by = c("driver_id", "date")]
+
+```
+
+Based on the available dates we can now extract day of the week, factor and order them as Monday to Sunday.  
+
+```{r ExtractingDayOfWeek}
+
+# Extracting Day of the week from date
+dtDayDuration[, day_of_week := weekdays(date, abbreviate = FALSE)]
+
+# ordering day of the week
+dtDayDuration[, day_of_week := factor(day_of_week,
+                                      levels = c("Monday", "Tuesday",
+                                                 "Wednesday", "Thursday",
+                                                 "Friday", "Saturday",
+                                                 "Sunday"))]
+
+```
+
+## Exploring Driver Details
+
+We have the dataset loaded into the environment. We can now explore the population distribution of drivers.  
+
+### Gender Distribution
+
+```{r DriverGenderDistribution, fig.cap="fig. 3", fig.align='center'}
+
+# Gender Distribution
+dtGenderDistribution <- dtDriverDetails[, .N, by = "gender"][, N_pct := N/sum(N)]
+
+# Plot to visualize gender distribution
+ggplot(dtGenderDistribution) +
+  geom_bar(aes(x = gender, y = N_pct), 
+           stat = "identity", width = 0.25) +
+  xlab("Gender") + 
+  ylab("No. of Drivers (%)") +
+  scale_y_continuous(labels = scales::percent) +
+  ggtitle("Gender Distribution")
+
+```
+
+<br>
+
+Fig. 3 shows that the percentage of male drivers is more than female drivers.
+
+### Age Distribution
+
+To understand the driver age distribution in the sample, we need to bin the age into groups of range 10.  
+
+```{r DriverAgeDistribution, fig.cap="fig. 4", fig.align='center'}
+
+# Splitting Driver Age into Bins
+dtDriverDetails[, age_bin := cut(age,
+                                 breaks = c(min(dtDriverDetails$age), 
+                                            seq(20, 100, 10)),
+                                 include.lowest = T)]
+
+# Age Distribution
+dtAgeDistribution <- dtDriverDetails[, .N, by = "age_bin"][, N_pct := N/sum(N)]
+
+# Plot to visualize age distribution
+ggplot(dtAgeDistribution) +
+  geom_bar(aes(x = age_bin, y = N_pct), 
+           stat = "identity") +
+  xlab("Age Group") + 
+  ylab("No. of Drivers (%)") +
+  scale_y_continuous(labels = scales::percent) +
+  ggtitle("Age Distribution")
+
+```
+
+<br>
+
+From fig. 4, it can be observed that the percentage of drivers between 20 - 30 age group are more in number and the percentage of drivers in each of age group decreases for higher age group.  
+**Note:** Drivers between 10 - 20 is very young age group and may not have license to drive.   
+
+### Distribution By Number of Kids for Drivers
+
+```{r DriverWithKidsSizeDistribution, fig.cap="fig. 5", fig.align='center'}
+
+# No. Of Kids Distribution
+dtNoOfKids <- dtDriverDetails[, .N, by = "number_of_kids"][, N_pct := N/sum(N)]
+
+# Plot to visualize Driver with No. of Kids
+ggplot(dtNoOfKids) +
+  geom_bar(aes(x = number_of_kids, y = N_pct), 
+           stat = "identity") +
+  xlab("No. Of Kids") + 
+  ylab("No. of Drivers (%)") +
+  scale_y_continuous(labels = scales::percent) +
+  ggtitle("Online Duration Distribution by Number of Kids")
+
+```
+
+<br>
+
+High percentage of sample has zero number of kids and there is similar percentage for other size groups.   
+
+### Distribution By Driver Age and Number of Kids
+
+```{r DriverAgeNoOfKids, fig.cap="fig. 6", fig.align='center'}
+
+# Age and number of kids bins population calculation
+dtAgeNoOfKids <- dtDriverDetails[, .N, 
+                                 by = c("number_of_kids", 
+                                        "age_bin")][, N_pct := N/sum(N)]
+
+# Plot to visualize age and no of kids online duration distribution
+ggplot(dtAgeNoOfKids) +
+  geom_tile(aes(x = age_bin, 
+                y = number_of_kids, 
+                fill = N_pct)) +
+  scale_fill_continuous(low = "#c6dbef", 
+                        high = "#08306b",
+                        label = scales::percent) +
+  theme(legend.position = "bottom") +
+  xlab("Age Group") +
+  ylab("No. Of Kids") +
+  ggtitle("Distribution for Age and No. of Kids")
+
+```
+
+<br>
+
+Driver with age group 20 - 30 and zero number of groups are more in number and driver with zero number of kids are more in number relative to other size of number number.  
+
+## Exploring Training Data
+
+### Duration Online Distribution By Day of Week
+
+With the extracted day of week from the dates we can understand driver online behaviour by day of week.  
+
+```{r DayOfWeekDistribution, fig.cap="fig. 7", fig.align='center'}
+
+# Calculating duration online for each day of the week
+dtDurationOnlinePerDayType <- dtDayDuration[, 
+                    .(total_duration_online_hrs = sum(duration_online_hrs)),
+              by = day_of_week][, 
+  duration_online_pct := total_duration_online_hrs/sum(total_duration_online_hrs)]
+
+# Plot to visualize duration online on each day
+ggplot(dtDurationOnlinePerDayType) +
+  geom_bar(aes(x = day_of_week, y = duration_online_pct), 
+           stat = "identity") +
+  xlab("Day") + 
+  ylab("Duration Online (%)") +
+  ggtitle("Total Duration Distribution for Day of the Week for All Drivers") +
+  scale_y_continuous(labels = scales::percent)
+
+```
+
+<br>
+
+The above chart shows that total duration online by each day of week. It proves a simple hypothesis that the number of drivers or duration available on weekdays is more than on weekends. Also, only **`r round((length(unique(dtDayDuration[day_of_week %in% c("Saturday", "Sunday"), driver_id]))/length(unique(dtDayDuration[day_of_week %in% c("Monday", "Tuesday", "Wednesday", "Thursday","Friday"), driver_id]))) * 100)`%** of the drivers are available online on weekends.  
+
+I will merge the drivers details with driver duration online per day data to explore each type of driver online behaviour based on his details. I will also extract features like is_weekend, is_next_day_weekend and is_previous_day_weekend to understand the average duration online on such conditions.  
+
+```{r DriverDayDurationWithDriverDetails}
+
+# Calculating Duration Online by day of the week
+dtDriverDayDuration <- dtDayDuration[, 
+                .(duration_online_hrs = sum(duration_online_hrs)), 
+                  by = c("driver_id", "day_of_week")]
+
+# Merging Each Driver Day Duration with Driver Details
+dtDriverDayDuration <- merge(dtDriverDayDuration,
+                             dtDriverDetails,
+                             by = "driver_id",
+                             all.x = T, 
+                             all.y = F)
+
+# Merging driver details with duration online data for each day and each driver
+dtDayDuration <- merge(dtDayDuration,
+                       dtDriverDetails,
+                       by = "driver_id",
+                       all.x = T, all.y = F)
+
+# Creating a variable if the day is weekday or weekend
+dtDayDuration[, is_weekend := as.factor(
+  ifelse(day_of_week %in% c("Saturday",
+                            "Sunday"),
+         1, 0))]
+
+# Creating variables if next day is weekend 
+dtDayDuration[, is_next_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Friday",
+                            "Saturday"),
+         1, 0))]
+
+# Creating a variable if previous day is weekend
+dtDayDuration[, is_previous_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Sunday",
+                            "Monday"),
+         1, 0))]
+
+```
+
+
+```{r IsWeekendBoxPlot, fig.cap="fig. 8", fig.align='center'}
+
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = is_weekend, 
+                   y = duration_online_hrs,
+                   group = is_weekend), 
+               width = 0.30) +
+  xlab("Is Weekend") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Pey Day If Weekend")
+
+```
+
+<br>
+
+In the above fig, the average duration online on weekends is significantly more than on weekdays and it was calculated earlier that there are less number drivers available during weekends which says that, drivers who are available on weekends are available for longer duration.  
+
+```{r IsNextDayWeekend, fig.cap="fig. 9", fig.align='center'}
+
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = is_next_day_weekend, 
+                   y = duration_online_hrs,
+                   group = is_next_day_weekend), 
+               width = 0.30) +
+  xlab("Is Next Day Weekend") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day If Next Day is Weekend")
+
+```
+
+<br>
+
+```{r IsPreviousDayWeekend, fig.cap="fig. 10", fig.align='center'}
+
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = is_previous_day_weekend, 
+                   y = duration_online_hrs,
+                   group = is_previous_day_weekend), 
+               width = 0.30) +
+  xlab("Is Previous Day Weekend") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day If Previous Day is Weekend")
+
+```
+
+<br>
+
+From fig. 9 and 10, it shows that there is no significant variation in average duration online if the previous or next day is weekend.   
+
+```{r DurationOnlineDayOfWeekTable, fig.cap="table. 1", fig.align='center'}
+
+# Calculation of mean and variance for duration online by day of week
+dtDayOfWeekMeanVariance <- dtDayDuration[, 
+                            .(mean_duration_online = round(
+                              mean(duration_online_hrs), 2),
+                              variance_duration_online = round(
+                                var(duration_online_hrs), 2)),
+                                         by = day_of_week]
+
+# Ordering day of the week
+dtDayOfWeekMeanVariance[, day_of_week := factor(day_of_week,
+                                                levels = c("Monday", "Tuesday",
+                                                           "Wednesday",
+                                                           "Thursday",
+                                                           "Friday", "Saturday",
+                                                           "Sunday"))]
+
+# Ordering by the day of week
+setorder(dtDayOfWeekMeanVariance, day_of_week)
+
+# Showing the results as table
+DT::datatable(dtDayOfWeekMeanVariance, rownames = F)
+
+```
+
+<br>
+
+```{r DurationOnlineDayOfWeekBoxPlot, fig.cap="fig. 11", fig.align='center'}
+
+# Boxplot to visualize summary stats of driver online time by gender
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = day_of_week, 
+                   y = duration_online_hrs)) +
+  xlab("Day of Week") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day By Day of Week")
+
+```
+
+<br>
+
+From the above statistics and boxplot, the drivers who are available online over the weekend are available for longer duration than on weekdays. It can also be observed that mean and vairance are varying a lot from weekdays to weekends.  
+
+We can now explore the availability of driver online based on their personal details.  
+
+### Duration Online Distribution By Gender
+
+```{r MeanDurationOnlineByGenderTimeSeries, fig.width=8, fig.cap="fig. 12", fig.align='center'}
+
+# Calculating per day mean duration online by gender
+dtMeanDayDurationByGender <- dtDayDuration[, 
+                      .(average_duration_online_hrs = mean(duration_online_hrs)), 
+                      by = c("date", "gender")]
+
+# Timeseries plot to visualize duration online by each gender group
+ggplot(dtMeanDayDurationByGender) +
+  geom_line(aes(x = date, y = average_duration_online_hrs,
+                group = gender, color = gender)) +
+  theme(legend.position = "bottom") +
+  xlab("Date") +
+  ylab("Mean Duration Online") +
+  ggtitle("Timseries of Mean Duration Online by Gender")
+
+```
+
+<br>
+
+Fig. 11 shows that the average duration online from female group is relatively low compared to male group on each day.  
+
+```{r DurationOnlineByGender, fig.cap="fig. 13", fig.align='center'}
+
+# Calculating for duration online by gender
+dtGenderOnline <- dtDriverDayDuration[, 
+                .(duration_online_hrs = sum(duration_online_hrs)),
+                by = gender][, duration_online_pct := duration_online_hrs/sum(duration_online_hrs)]
+
+# Plot to visualize online duration by gender
+ggplot(dtGenderOnline) +
+  geom_bar(aes(x = gender, y = duration_online_pct), 
+           stat = "identity", width = 0.25) +
+  xlab("Gender") + 
+  ylab("Duration Online (%)") +
+  scale_y_continuous(labels = scales::percent) +
+  ggtitle("Total Online Duration Distribution By Gender")
+
+```
+
+<br>
+
+The total duration online is very low for female group.  
+
+```{r DurationOnlineGenderBoxplot, fig.cap="fig. 14", fig.align='center'}
+
+# Boxplot to visualize summary stats of driver online time by gender
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = gender, 
+                   y = duration_online_hrs),
+               width = .30) +
+  xlab("Gender") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day By Gender")
+
+```
+
+<br>
+
+The average duration online is high for male drivers compared to female drivers.  
+
+### Duration Online Distribution By Age Group
+
+```{r MeanDurationOnlineByAgeGroupTimeSeries, fig.width=8, fig.cap="fig. 15", fig.align='center'}
+
+# Calculating duration online by each age group
+dtMeanDayDurationOnlineByAgeGroup <- dtDayDuration[,
+                      .(average_duration_online_hrs = mean(duration_online_hrs)),
+                      by = c("date", "age_bin")]
+
+# Timeseries plot to visualize duration online by each age group
+ggplot(dtMeanDayDurationOnlineByAgeGroup) +
+  geom_line(aes(x = date, y = average_duration_online_hrs,
+                group = age_bin, color = age_bin)) +
+  theme(legend.position = "bottom") +
+  xlab("Date") +
+  ylab("Mean Duration Online") +
+  ggtitle("Timseries of Mean Duration Online by Age Group")
+
+```
+
+<br>
+
+Driver average duration online is high for low age groups and vice-versa.  
+
+```{r DurationOnlineByAgeGroup, fig.cap="fig. 16", fig.align='center'}
+
+# Calculating Duration by each age group
+dtAgeGroupOnline <- dtDriverDayDuration[, 
+                    .(duration_online_hrs = sum(duration_online_hrs)),
+                    by = "age_bin"][, 
+                duration_online_pct := duration_online_hrs/sum(duration_online_hrs)]
+
+# Plot to visualize online duration by each age group
+ggplot(dtAgeGroupOnline) +
+  geom_bar(aes(x = age_bin, 
+               y = duration_online_pct), 
+           stat = "identity") +
+  xlab("Age Group") + 
+  ylab("Duration Online (%)") +
+  ggtitle("Total Duration Online Distribution By Age Group") +
+  scale_y_continuous(labels = scales::percent)
+
+```
+
+<br>
+
+Total duration online is high for 20 - 30 age group and decreases from there on.  
+
+
+```{r DurationOnlineAgeGroupBoxplot, fig.cap="fig. 17", fig.align='center'}
+
+# Boxplot to visualize summary stats of driver online time by age group
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = age_bin, 
+                   y = duration_online_hrs)) +
+  xlab("Age Group") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day By Age Group")
+
+```
+
+<br>
+
+Average duration online by different age groups is decreasing with increasing age groups.  
+**Note:** 50 - 60 age group have lowest overall duration online which could be attributed to the combination of total duration online as well as total population in the age group.  
+
+### Duration Online Distribution By Number of Kids
+
+```{r MeanDurationOnlineByNoOfKidsTimeSeries, fig.width=8, fig.cap="fig. 18", fig.align='center'}
+
+# Calculating mean duration online by number of kids per day 
+dtMeanDayDurationOnlineByNoOfKids <- dtDayDuration[,
+                      .(average_duration_online_hrs = mean(duration_online_hrs)),
+                      by = c("date", "number_of_kids")]
+
+# Coverting number of kids to factors
+dtMeanDayDurationOnlineByNoOfKids[, number_of_kids := as.factor(number_of_kids)]
+
+# Timeseries visualization by number of kids
+ggplot(dtMeanDayDurationOnlineByNoOfKids) +
+  geom_line(aes(x = date, y = average_duration_online_hrs,
+                group = number_of_kids, color = number_of_kids)) +
+  theme(legend.position = "bottom") +
+  xlab("Date") +
+  ylab("Mean Duration Online") +
+  ggtitle("Timseries of Mean Duration Online by Number of Kids")
+
+```
+
+<br>
+
+Drivers with more number of kids have higher average duration online for each day.    
+```{r DurationOnlineByKids, fig.cap="fig. 19", fig.align='center'}
+
+# Calculating Duration by number of kids
+dtNoOfKidsOnline <- dtDriverDayDuration[,
+                    .(duration_online_hrs = sum(duration_online_hrs)),
+                    by = "number_of_kids"][,
+              duration_online_pct := duration_online_hrs/sum(duration_online_hrs)]
+
+# Plot to visualize online duration by number of kids
+ggplot(dtNoOfKidsOnline) +
+  geom_bar(aes(x = number_of_kids, 
+               y = duration_online_pct), 
+           stat = "identity") +
+  scale_y_continuous(labels = scales::percent) +
+  xlab("Number of Kids") + 
+  ylab("Duration Online (%)") +
+  ggtitle("Total Duration Online Distribution By Number of Kids")
+
+```
+
+<br>
+
+```{r DurationOnlineNoOfKidsBoxplot, fig.cap="fig. 20", fig.align='center'}
+
+# Boxplot to visualize summary stats of driver online time by number of kids
+ggplot(dtDayDuration) +
+  geom_boxplot(aes(x = number_of_kids, 
+                   y = duration_online_hrs,
+                   group = number_of_kids)) +
+  xlab("No. Of Kids") +
+  ylab("Duration Online (hrs)") +
+  ggtitle("Summary Statistics Of Duration Online Per Day By No of Kids")
+
+```
+
+<br>
+
+Although, total duration available online is very high for drivers with zero number of kids but there is no significant change in average with the different size of number of kids.  
+
+Till now we have explored the driver behaviour by single variable. We can now explore the behaviour with multiple variables.  
+
+### Duration Online Distribution By Age and Day of Week
+
+```{r AgeAndDayTypeOnlineDurationDistribution, fig.cap="fig. 21", fig.align='center'}
+
+# Calculation for Age and Day of Week Distrubution
+dtAgeWeekDayOnlineDuration <- dtDayDuration[, 
+                    .(mean_duration_online_hrs = mean(duration_online_hrs)),
+                      by = c("age_bin", "day_of_week")]
+
+# Plot to visualize Duration Online on Age Group vs Day of Week Distribution
+ggplot(dtAgeWeekDayOnlineDuration) +
+  geom_tile(aes(x = age_bin, 
+                y = day_of_week, 
+                fill = mean_duration_online_hrs)) +
+  scale_fill_continuous(low = "#c6dbef", 
+                        high = "#08306b") +
+  theme(legend.position = "bottom") +
+  xlab("Age Group") +
+  ylab("Day") +
+  ggtitle("Age and Day Mean Duration Online Distribution")
+
+```
+
+<br>
+
+The average duration available online is very high for low age group on weekends. Also, the trend in the average keeps decreasing with age groups and is quite less on weekdays.  
+
+### Duration Online Distribution By Age and Number of Kids
+
+```{r AgeNoOfKidsDistribution, fig.cap="fig. 22", fig.align='center'}
+
+# Calculation for Age and No of Kids Distribtion
+dtAgeKidsOnlineDuration <- dtDayDuration[,
+                      .(mean_duration_online_hrs = mean(duration_online_hrs)),
+                      by = c("age_bin", "number_of_kids")]
+
+# Plot to visualize age and no of kids online duration distribution
+ggplot(dtAgeKidsOnlineDuration) +
+  geom_tile(aes(x = age_bin, 
+                y = number_of_kids, 
+                fill = mean_duration_online_hrs)) +
+  scale_fill_continuous(low = "#c6dbef", 
+                        high = "#08306b") +
+  theme(legend.position = "bottom") +
+  xlab("Age Group") +
+  ylab("No. Of Kids") +
+  ggtitle("Age and No. of Kids Mean Duration Online Distribution")
+
+```
+
+<br>
+
+Although the population in 20 - 30 age group is quite high relative to other groups, the average duration online per each day is less. Drivers with low age group and higher number of kids could be attributed to population size of that age group. There is specific pattern in duration online with age group and number of kids.  
+
+### Duration Online Distribution By Day of Week and Number of Kids
+
+```{r DayOfWeekNoOfKidsDistribution, fig.cap="fig. 23", fig.align='center'}
+
+# Calculation for Age and No of Kids Distribtion
+dtWeekKidsOnlineDuration <- dtDayDuration[,
+                      .(mean_duration_online_hrs = mean(duration_online_hrs)),
+                      by = c("day_of_week", "number_of_kids")]
+
+# Plot to visualize age and no of kids online duration distribution
+ggplot(dtWeekKidsOnlineDuration) +
+  geom_tile(aes(x = number_of_kids, 
+                y = day_of_week, 
+                fill = mean_duration_online_hrs)) +
+  scale_fill_continuous(low = "#c6dbef", 
+                        high = "#08306b") +
+  theme(legend.position = "bottom") +
+  xlab("No. Of Kids") +
+  ylab("Day") +
+  ggtitle("No. of Kids and Day Mean Duration Online Distribution")
+
+```
+
+<br>
+
+The above chart also confirms that driver spend more time weekends irrespective of number of kids they have.   
+
+With the patterns explored through EDA, in the next section I will use various techniques to build model for duration online prediction for 1 week of test data.  
+
+# Modelling 
+
+The training/learning set contains number of hours online for each driver from 1st June to 21st June, 2017 and we need to predict from 22nd June to 28th June, 2018.  
+
+## Data Imputation
+
+Since there are missing dates between 01 June, 2017 to 21 June, 2017, for some of the drivers we need to create dates for missing drivers and insert zero as duration online for the missing dates as the driver is offline.    
+
+```{r DataImputation}
+
+# Creating Missing dates and mering with training set
+dtDayDuration <- merge(
+  data.table(driver_id = rep(unique(dtDayDuration$driver_id), each = 21),
+           date = seq(as.Date("2017-06-01"),
+                           as.Date("2017-06-21"),
+                           1)),
+  dtDayDuration,
+  by = c("driver_id", "date"),
+  all = T)
+
+# Filling NAs with zero as the drivers ping data is not available on that date
+# and hence the driver is offline for that day
+dtDayDuration[, duration_online_hrs := ifelse(is.na(duration_online_hrs),
+                                              0,
+                                              duration_online_hrs)]
+
+# Extracting day of the week
+dtDayDuration[, day_of_week := weekdays(date, abbreviate = F)]
+
+# Back filling out the missing driver details  
+dtDayDuration[, c("gender", "age",
+                  "number_of_kids",
+                  "age_bin") := lapply(.SD,
+                                       function(x){
+                                         na.locf(x, na.rm = F)
+                                       }),
+              .SDcols = c("gender", "age",
+                  "number_of_kids",
+                  "age_bin"),
+              by = "driver_id"]
+
+# Forward filling the missing driver details with driver_id
+dtDayDuration[, c("gender", "age",
+                  "number_of_kids",
+                  "age_bin") := lapply(.SD,
+                                       function(x){
+                                         na.locf(x, fromLast = T, na.rm = F)
+                                       }),
+              .SDcols = c("gender", "age",
+                  "number_of_kids",
+                  "age_bin"),
+              by = "driver_id"]
+
+```
+
+## Feature Engineering
+
+Gender is a categorical variable with only Male and Female as its values. In order to make the variable as usable feature, I will transform the categorical variable as boolean i.e. I will create **is_male** with True or False to tackle the categorical nature of gender.  
+
+We have observed earlier that mean and variance within weekend or weekdays is not significantly different. So, we can create a variable as **is_weekend** with True or False. Similarly, we can also create a variable as **at_least_one_kid**.   
+
+```{r FeatureEngineering}
+
+# Creating a feature if the driver is male or not
+dtDayDuration[, is_male := as.factor(ifelse(gender == "MALE", 1, 0))]
+
+# Converting number of kids to appropriate data type
+dtDayDuration[, number_of_kids := as.integer(number_of_kids)]
+
+# Creating a variable if the day is weekday or weekend
+dtDayDuration[, is_weekend := as.factor(
+  ifelse(day_of_week %in% c("Saturday",
+                            "Sunday"),
+         1, 0))]
+
+# Creating variables if next day is weekend 
+dtDayDuration[, is_next_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Friday",
+                            "Saturday"),
+         1, 0))]
+
+# Creating a variable if previous day is weekend
+dtDayDuration[, is_previous_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Sunday",
+                            "Monday"),
+         1, 0))]
+
+# Creating a variable if driver has atleast one variable
+dtDayDuration[, at_least_one_kid := as.factor(
+  ifelse(number_of_kids > 0, 1, 0)
+  )]
+
+```
+
+We can use existing variables as well as the extracted features in building our model.  
+
+## Time Series Forecasting
+
+### Stationarity of Time Series 
+
+From table. 1 and from fig. 7 and fig. 11, we can see that mean and variance of duration online is quite similar within weekdays and weekdays but different across weekdays and weekends i.e. we can find that there is weekly cyclic component when observed for all drivers.  
+
+```{r IndividualDriverPattern, fig.cap="fig. 24", fig.width=8, fig.height=6, fig.align='center'}
+
+ggplot(dtDayDuration[driver_id %in% unique(dtDayDuration$driver_id)[1:4]]) +
+  geom_line(aes(x = date, 
+                y = duration_online_hrs)) +
+  geom_point(aes(x = date, 
+                y = duration_online_hrs)) +
+  facet_grid(driver_id ~ .) +
+  xlab("Ping Date") +
+  ylab("Duration Online (hrs)") +
+  ggtitle(paste0("Individual Driver Duration Online Timeline Sample"))
+
+```
+
+<br>
+
+Above chart shows typical behaviour for few drivers. We can see that there is weekly cyclic pattern by each driver. There isn't any trend component also (the number of online hours might not increase with time).   
+
+To perform a time series forecasting the data has to be stationary. To check if the data is stationary or not, we can use **Dickey-Fuller Test**.  
+
+### Dickey-Fuller Test for Stationarity
+
+```{r DickeyFullerTestForStationarity}
+
+adf.test(dtDayDuration$duration_online_hrs)
+
+```
+
+<br>
+
+The computed p-value is less than 0.01, which means that we can accept the alternative hypothesis i.e. the data is stationary for all the driver. But, to perform time series forecasting we need to perform the test by each driver rather than testing on overall data. Also, fitting a time series model for each driver seperately could lead to over fitting and there are driver_ids present testing set which are not available in training set to fit a time series model.   
+
+Based on the above summary, I would like to treat the problem as regression.  
+
+## Regression
+
+### Linear Regression
+
+We can now build our first model using **age,** **number_of_kids,** **is_male** and **is_weekend** as predictor variables and **duration_online_hrs** as response variable.   
+
+```{r LinearRegressionModel1}
+
+lm.fit1 <- lm(duration_online_hrs ~ is_weekend + age + number_of_kids + 
+                is_male,
+               data = dtDayDuration)
+
+```
+
+```{r lm.fit1_ResidualsHistogram, fig.cap="fig. 25", fig.align='center'}
+
+hist(lm.fit1$residuals, 
+     breaks = 100, 
+     xlab = "Residuals",
+     main = "Histogram of Residual for lm.fit1")
+
+```
+
+<br>
+
+```{r LMModel1Output}
+
+summary(lm.fit1)
+
+```
+
+<br>
+
+The distribution of residuals is not symmetric around mean and has peaks towards negative side i.e. the predicted values more than the actual values.  
+
+p-values are very close to zero and the signif. codes suggests that the considered variables are highly significant, So, we can conclude that there is a relationship between **duration_online_hrs** and considered variables.  
+
+Residual standard error is `r round(sqrt(mean(lm.fit1$residuals^2)), 2)` which is quite high and there is still a chance that the prediction will be off by `r round(sqrt(mean(lm.fit1$residuals^2))/mean(dtDayDuration$duration_online_hrs) * 100)` %.  
+
+The Adjusted R-squared is quite low which suggests that the variance in the **duration_onlin_hrs** cannot be explained by predictor variables.  
+
+F-statistic value of 1903 which is quite farther away from 1 suggest there is relation between dependent and independent variables but the strength of relationship cannot be accurately determined given the high number of observations.  
+The estimates for age and number of kids is quite low. Since `r round(nrow(dtDriverDetails[number_of_kids == 0])/nrow(dtDriverDetails) * 100)` % of drivers have zero kids, I will use **at_least_one_kid** as my predictor instead of **number_of_kids** for model and see if it improves the results.  
+
+```{r LinearRegressionModel2}
+
+# Linear Model with at least one kid instead of number_of_kids
+lm.fit2 <- lm(duration_online_hrs ~ is_weekend + age + at_least_one_kid + 
+                is_male,
+               data = dtDayDuration)
+
+summary(lm.fit2)
+
+```
+
+<br>
+
+The estimate of **at_least_one_kid** in the output of linear model 2 shows better relationship with response variable compared to **number_of_kids** but, there is no significant change in terms of RMSE or F-statistic.   
+
+Since high concentration i.e. about `r round(nrow(dtDriverDetails[age_bin == "(20,30]"])/nrow(dtDriverDetails) * 100)` % of drivers fall in (20,30] age group, I will use **age_bin** instead of age.   
+
+```{r AgeBinLevelsOrder, results='hide', echo=FALSE}
+
+# Checking the order of factor in Age Bin
+levels(dtDayDuration$age_bin)
+
+```
+
+```{r AgeBinLinearRegressionModel}
+
+# Linear model with age_bin instead of age
+lm.fit3 <- lm(duration_online_hrs ~ is_weekend + age_bin + at_least_one_kid + 
+                is_male,
+               data = dtDayDuration)
+
+```
+
+
+```{r HistogramOfResidualLM3, fig.align='center', fig.cap="fig. 26"}
+
+# Histogram of residuals from age_bin model
+hist(lm.fit3$residuals, 
+     breaks = 100, 
+     xlab = "Residuals",
+     main = "Histogram of Residual for lm.fit3")
+
+```
+
+<br>
+
+```{r SummaryOfLinearModel3}
+
+# summary of the model results
+summary(lm.fit3)
+
+```
+
+<br>
+
+The residual standard error has decrease by very small amount compared to previous models. Also, there is slight increase in Adjusted R-squared.   
+
+I will now use variables **is_next_day_weekend** and **is_previous_day_weekend** to see how they will improve the model.  
+
+```{r NextDayPreviousDayModel}
+
+# Linear model with is_next_day_weekend and is_previous_day_holiday
+lm.fit4 <- lm(duration_online_hrs ~ is_weekend + age_bin + at_least_one_kid + 
+                is_male + is_next_day_weekend + is_previous_day_weekend,
+               data = dtDayDuration)
+
+# Summary of the model results
+summary(lm.fit4)
+
+```
+
+<br>
+
+From the above summary of the model, the estimates for is_next_day_weekend or is_previous_day_weekend is quite low and p-value is quite high, which suggests us that there is weak relationship between the dependent varible and these variables.   
+
+June 01 and June 26, 2017 are public holidays which are Birth of Pancasila and Eid al-Fitr respectively, I will create a new variable to check if its a holiday or not along with weekends and see if they improve the model.  
+
+```{r AddingHolidayCalender}
+
+dtDayDuration[, is_holiday := ifelse(date == as.Date("2017-06-01") |
+                                       is_weekend == 1, 1, 0)]
+
+```
+
+As the number of holidays are quite less in the training set I wouldn't expect much change in the model output.  
+
+```{r RegressionWithHolidayColumn}
+
+# Regression with is_holiday variable
+lm.fit5 <- lm(duration_online_hrs ~ is_holiday + age_bin + 
+                at_least_one_kid + is_male,
+               data = dtDayDuration)
+
+# Summary of the model results
+summary(lm.fit5)
+
+```
+
+<br>
+
+As expected there hasn't been much improvement in the results.  
+
+### Chi-square Test
+
+We have observed very high variance in the above models. I will check if the variables is_weekend and is_male are independent i.e. the occurance of values in the two variables is strictly by chance by using chi-square test.  
+
+```{r ChisquareTestOfIndependence}
+
+# Chi-square test for collinearity of categorical variables
+chisq.test(table(dtDayDuration$is_weekend, dtDayDuration$is_male))
+
+```
+
+We can observe very low chi-square value with degree of freedom 1 and p-value as very high and hence we can accept the null hypothesis saying that the two variables are independent with each other.  
+
+### Lasso and Ridge Regression
+
+We have observed that the variables is_male and is_weekend are independent with each other, but we can use Lasso or Ridge regression methods when there is collinearity between independent variables and hence ignoring these methods of regression.  
+
+## Decision Trees
+
+### Regression Using Recursive Partition 
+
+We have found that linear regression is not giving us better results. We can use regression trees to see if there is non-linear relationship between dependent variable and independent variables. It is also easier to explain regression through decision trees.  
+
+```{r RpartTreeModel}
+
+# Applying decision trees for regression
+tree.fit1 <- rpart(duration_online_hrs ~ is_weekend + age_bin + 
+                     at_least_one_kid + is_male, 
+                   data = dtDayDuration,
+                   method = "anova",
+                   control = rpart.control(minsplit = 20, cp = 0.0001))
+
+dtDayDuration[, predicted := predict(tree.fit1, dtDayDuration)]
+
+dtDayDuration[, residuals := duration_online_hrs - predicted]
+
+```
+
+<br>
+
+Summary statistics and histogram of residuals for rpart model are below:  
+
+```{r RpartTreeModelResidualsSummary}
+
+summary(dtDayDuration$residuals)
+
+```
+
+<br>
+
+```{r RegressionTreesModel1Residuals, fig.cap="fig. 27", fig.align='center'}
+
+hist(dtDayDuration$residuals, 
+     breaks = 100, 
+     xlab = "Residuals",
+     main = "Histogram of Residual for tree.fit1")
+
+```
+
+The calculated RMSE value is `r sqrt(mean(dtDayDuration$residuals^2))`.  
+
+<br>
+
+The visualization of decision tree output is shown below:    
+
+```{r TreeVisualization, fig.cap="fig. 28", fig.align='center'}
+
+fancyRpartPlot(tree.fit1, main = "Regression Tree Output")
+
+```
+
+<br>
+
+```{r TreeFitActualVsPredicted, fig.cap="fig. 29", fig.align='center'}
+
+ggplot(dtDayDuration) +
+  geom_point(aes(x = duration_online_hrs, y = predicted)) +
+  xlab("Actual") +
+  ylab("Predicted") +
+  ggtitle("Actual vs Predicted Values for Regression Trees")
+
+```
+
+<br>
+
+The main disadvantage of Regression tree is that the model predicts outcome as the mean of observed values in the leaf node. The variance of our tree model is `r if(var(dtDayDuration$predicted) > var(lm.fit3$fitted.values)){"greater"}` than regression model.  
+
+### Random Forest 
+
+We can reduce the variance of our predictions by combining results of multiple tree modeled on different sub samples of the same data set. Random Forest is ensemble technique which will help reduce the variance and give better results.  
+
+```{r randomForest}
+
+rf.fit1 <- randomForest(duration_online_hrs ~ is_weekend + age_bin + 
+                     at_least_one_kid + is_male, 
+                        data = dtDayDuration)
+
+dtDayDuration[, predicted := predict(rf.fit1, dtDayDuration)]
+
+dtDayDuration[, residuals := duration_online_hrs - predicted]
+
+```
+
+Summary statistics and histogram of residuals for Random Forest model are below:
+
+```{r RandomForestSummaryStats}
+
+summary(dtDayDuration$residuals)
+
+```
+
+<br>
+
+```{r RandomForestModel1Residuals, fig.cap="fig. 30", fig.align='center'}
+
+hist(dtDayDuration$residuals, 
+     breaks = 100, 
+     xlab = "Residuals",
+     main = "Histogram of Residual for rf.fit1")
+
+```
+
+<br>
+
+The calculated RMSE value is `r sqrt(mean(dtDayDuration$residuals^2))`.  
+
+```{r RFPredictVsActualPlot, fig.cap="fig. 31", fig.align='center'}
+
+ggplot(dtDayDuration) +
+  geom_point(aes(x = duration_online_hrs, y = predicted)) +
+  xlab("Actual") +
+  ylab("Predicted") +
+  ggtitle("Actual vs Predicted for Random Forest Regression")
+
+```
+
+The main disadvantage in case of Random Forest is that the predicted value is the mean of outcomes of multiple decision trees.  
+
+## Prediction
+
+Among all the built models, lm.fit3 has less RMSE and better Adjusted R-squared value compared to the other models. Hence, I will use lm.fit3 model to predict duration online for June 22, 2017 to June 28th, 2017. 
+
+I will create features like **day_of_week,** **is_male,**, **is_weekend,** **is_next_day_weekend,** **is_previous_day_weekend,** **is_holiday** and **at_least_one_kid** in the testing set similar to the training set.  
+
+```{r FeatureExtractionForTestingSet}
+
+# Extracting day of week
+dtTest[, day_of_week := weekdays(date, abbreviate = F)]
+
+# merging training set with driver details
+dtTest <- merge(dtTest,
+                dtDriverDetails,
+                by = "driver_id",
+                all.x = T, all.y = F)
+
+# Creating a variable if the driver is male or not
+dtTest[, is_male := as.factor(ifelse(gender == "MALE", 1, 0))]
+
+# Converting number of kids to appropriate data type
+dtTest[, number_of_kids := as.integer(number_of_kids)]
+
+# Creating a variable if the day is weekday or weekend
+dtTest[, is_weekend := as.factor(
+  ifelse(day_of_week %in% c("Saturday",
+                            "Sunday"),
+         1, 0))]
+
+# Creating variables if next day is weekend 
+dtTest[, is_next_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Friday",
+                            "Saturday"),
+         1, 0))]
+
+# Creating a variable if previous day is weekend
+dtTest[, is_previous_day_weekend := as.factor(
+  ifelse(day_of_week %in% c("Sunday",
+                            "Monday"),
+         1, 0))]
+
+# Creating is_holiday column by assuming Weekends are holiday along with 26th as
+# Eid Al Fitr
+dtTest[, is_holiday := ifelse(date == as.Date("2017-06-26") |
+                                is_weekend == 1, 1, 0)]
+
+# Creating at_least_one_kid variable from number of kids
+dtTest[, at_least_one_kid := as.factor(
+  ifelse(number_of_kids > 0, 1, 0)
+  )]
+
+```
+
+
+```{r TestingModel, fig.cap="fig. 32", fig.align="center"}
+
+dtTest[, predicted := predict(lm.fit3, dtTest)]
+
+dtTest[, residuals := online_hours - predicted]
+
+ggplot(dtTest) +
+  geom_point(aes(x = online_hours, y = predicted)) +
+  xlab("Actual") +
+  ylab("Predicted") +
+  ggtitle("Actual vs Predicted Comparison")
+
+```
+
+<br>
+
+Summary statistics of residuals for test data are below:
+
+```{r TestResidualsSummaryStats}
+
+summary(dtTest$residuals)
+
+```
+
+RMSE of the predicted values is `r sqrt(mean(dtTest$residuals^2))`.  
+
+Actual vs predicted values does not show much collinearity which says that the model is predicting very poorly. It could be because of the high variance within each of the driver segment in the training set or less number data points available for some of the driver segments in training set.  
+
+The following table shows the count of observations in each group and the variance within each group.  
+
+```{r VarianceBySegmentCalculation, fig.cap="table. 2", fig.align="center"}
+
+dtVarianceByDriverSegment <- dtDayDuration[, 
+                        .(count_of_observations = .N,
+                          var_duration_online = round(var(duration_online_hrs),
+                                                      2)), 
+                        by = c("is_weekend", "age_bin", 
+                               "at_least_one_kid", "is_male")]
+
+DT::datatable(dtVarianceByDriverSegment, rownames = F)
+
+```
+
+<br>
+
+```{r WritingTheOutputFile}
+
+write.csv(
+  dtTest,
+  paste0(
+    Sys.getenv("MyGitRepo"),
+    "/Go-Jek/PredictedOutput.csv"
+  ),
+  row.names = F
+)
+
+```
+
+<br>
+
+# Conculsion
+
+We have built various models using linear regression and decision trees and we have observed that the RMSE is quite high and the predicted results have been very poor. But, We can improve the model by looking at few other variables like driver's economic status, vehicle ownership (if the vehicle has been owned by taking loan) or liabilities. We can use number of dependents rather than using number of kids to improve the model as these factors might push the driver to spend more time online. Also, if it is allowed in Indonesia for a private car/bike owner to share his/her ride while commuting then available duration online might affect.  
+
+<br>
+<br>
